@@ -57,7 +57,7 @@ def build_foveated_tokens(
     # Average downsampling (like the official average mode)
     # img is (B, H, W, C)
     img_spatial = img.permute(0, 3, 1, 2) # (B, C, H, W)
-    img_down = torch_F.interpolate(img_spatial, scale_factor=1.0 / lr_factor, mode="bilinear")
+    img_down = torch_F.interpolate(img_spatial, scale_factor=1.0 / lr_factor, mode="bilinear") * float(lr_factor)
     img_down = img_down.permute(0, 2, 3, 1) # (B, h_d, w_d, C)
 
     # Construct output sequence
