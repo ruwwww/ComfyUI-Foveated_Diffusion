@@ -188,10 +188,8 @@ def _foveated_diffusion_model_wrapper(executor, x, timestep, context, y, guidanc
                                        **kwargs):
     """Wrapper injected via WrappersMP.DIFFUSION_MODEL.
 
-    1. Foveated-tokenize the latent (top-left LR selection)
-    2. Call forward_orig with the foveated token sequence
-       (standard attention + LoRA handles the mixed-resolution tokens)
-    3. Detokenize DiT output back to full-resolution latent
+    Receives pre-tokenized foveation sequence directly, runs model.forward_orig,
+    and returns tokenized output (avoiding step-by-step detokenization noise).
     """
     import logging
     logger = logging.getLogger("comfyui_foveated_diffusion")
@@ -208,36 +206,24 @@ def _foveated_diffusion_model_wrapper(executor, x, timestep, context, y, guidanc
     model = executor.class_obj  # Flux nn.Module
     mask = fov_state["mask"]
     lr_factor = fov_state["lr_factor"]
+    fov_indices = fov_state["fov_indices"]
+    h_len = fov_state["h_len"]
+    w_len = fov_state["w_len"]
 
-    B, C_lat, H_orig, W_orig = x.shape
-    patch_size = model.patch_size
+    # img_fov is passed directly inside x
+    img_fov = x
+    B = img_fov.shape[0]
     n_axes = len(model.params.axes_dim)
 
-    # ── 1. Full-res tokenisation via process_img ───────────────────
-    img, img_ids = model.process_img(x, transformer_options=transformer_options)
-    C_patched = img.shape[2]
-
-    h_len = ((H_orig + (patch_size // 2)) // patch_size)
-    w_len = ((W_orig + (patch_size // 2)) // patch_size)
-
-    img_spatial = img.view(B, h_len, w_len, C_patched)
+    # ── 1. Reconstruct fov_ids from process_img coordinates ──────
+    # Dummy latent to fetch full-res coordinates
+    dummy_x = torch.zeros(B, model.in_channels // (model.patch_size ** 2), h_len * model.patch_size, w_len * model.patch_size, device=x.device, dtype=x.dtype)
+    _, img_ids = model.process_img(dummy_x, transformer_options=transformer_options)
     img_ids_spatial = img_ids[0].view(h_len, w_len, n_axes)
-
-    # ── 2. Foveate tokens (top-left selection for LR blocks) ─────
-    img_fov, fov_indices = build_foveated_tokens(img_spatial, mask, lr_factor)
     img_ids_fov = build_crpa_img_ids(img_ids_spatial, mask, lr_factor, x.device, torch.float32)
     img_ids_fov = img_ids_fov.unsqueeze(0).expand(B, -1, -1)
 
-    n_tokens_input = h_len * w_len
-    n_tokens_fov = img_fov.shape[1]
-    logger.info(
-        "FoveatedDiffusion: %d -> %d tokens (%.1f%% reduction, lr_factor=%d)",
-        n_tokens_input, n_tokens_fov,
-        (1.0 - n_tokens_fov / n_tokens_input) * 100,
-        lr_factor,
-    )
-
-    # ── 3. Build txt_ids (same as _forward) ────────────────────────
+    # ── 2. Build txt_ids (same as _forward) ────────────────────────
     txt_ids = torch.zeros((B, context.shape[1], n_axes), device=x.device, dtype=torch.float32)
     if len(model.params.txt_ids_dims) > 0:
         for i in model.params.txt_ids_dims:
@@ -246,7 +232,7 @@ def _foveated_diffusion_model_wrapper(executor, x, timestep, context, y, guidanc
                 device=x.device, dtype=torch.float32,
             )
 
-    # ── 4. Build CRPA state (dual RoPE, resolution masks) ─────────
+    # ── 3. Build CRPA state (dual RoPE, resolution masks) ─────────
     crpa_state = build_crpa_state(
         img_ids_fov=img_ids_fov,
         txt_ids=txt_ids,
@@ -256,7 +242,7 @@ def _foveated_diffusion_model_wrapper(executor, x, timestep, context, y, guidanc
         pe_embedder=model.pe_embedder,
     )
 
-    # ── 5. Inject CRPA attention patches ──────────────────────────
+    # ── 4. Inject CRPA attention patches ──────────────────────────
     transformer_options = transformer_options.copy()
     transformer_options["crpa_state"] = crpa_state
     to = transformer_options
@@ -267,24 +253,14 @@ def _foveated_diffusion_model_wrapper(executor, x, timestep, context, y, guidanc
         copy_dict1=False,
     )
 
-    # ── 6. Run forward_orig with foveated sequence ────────────────
+    # ── 5. Run forward_orig directly with foveated sequence ────────
     out = model.forward_orig(
         img_fov, img_ids_fov, context, txt_ids,
         timestep, y, guidance, control,
         transformer_options=transformer_options,
     )
 
-    # ── 5. Detokenize ─────────────────────────────────────────────
-    out_full = reconstruct_tokens(
-        out, fov_indices, B, C_patched, h_len, w_len, mask, lr_factor,
-        device=x.device, dtype=x.dtype,
-    )
-    out_full = rearrange(
-        out_full, "b (h w) (c ph pw) -> b c (h ph) (w pw)",
-        h=h_len, w=w_len, ph=patch_size, pw=patch_size,
-    )[:, :, :H_orig, :W_orig]
-
-    return out_full
+    return out
 
 
 
@@ -359,12 +335,41 @@ class FoveatedKSampler:
                 f"not divisible by lr_factor ({lr_factor})"
             )
 
-        # Clone model and inject wrapper + fov_state
+        # Get model configs for patch sizes
+        base_model = model.get_model_object("diffusion_model")
+        patch_size = base_model.patch_size
+        n_axes = len(base_model.params.axes_dim)
+        h_len = H_lat // patch_size
+        w_len = W_lat // patch_size
+
+        # ── 1. Full-res tokenisation via process_img ───────────────────
+        # Process latent input once upfront to get spatial tokens shape
+        dummy_x = torch.zeros(B, base_model.in_channels // (patch_size ** 2), H_lat, W_lat, device=samples.device, dtype=samples.dtype)
+        dummy_img, _ = base_model.process_img(dummy_x, transformer_options=model.model_options.get("transformer_options", {}))
+        C_patched = dummy_img.shape[2]
+
+        # ── 2. Run Tokenization once upfront ──────────────────────────
+        # Generate initial noise in spatial domain
+        noise = comfy.sample.prepare_noise(latent_image["samples"], seed)
+        noise_img, _ = base_model.process_img(noise, transformer_options=model.model_options.get("transformer_options", {}))
+        noise_spatial = noise_img.view(B, h_len, w_len, C_patched)
+        noise_fov, _ = build_foveated_tokens(noise_spatial, mask_tensor, lr_factor)
+
+        # Tokenize empty/latent samples
+        samples_img, _ = base_model.process_img(samples, transformer_options=model.model_options.get("transformer_options", {}))
+        samples_spatial = samples_img.view(B, h_len, w_len, C_patched)
+        samples_fov, fov_indices = build_foveated_tokens(samples_spatial, mask_tensor, lr_factor)
+
+        # ── 3. Clone model and inject wrapper + fov_state ─────────────
         model_clone = model.clone()
         te = model_clone.model_options.get("transformer_options", {})
         te["fov_state"] = {
             "mask": mask_tensor,
             "lr_factor": lr_factor,
+            "fov_indices": fov_indices,
+            "h_len": h_len,
+            "w_len": w_len,
+            "C_patched": C_patched,
         }
 
         comfy.patcher_extension.add_wrapper_with_key(
@@ -376,50 +381,60 @@ class FoveatedKSampler:
         )
         model_clone.model_options["transformer_options"] = te
 
-        # Run sampling (ComfyUI standard path) with preview callback
-        noise = comfy.sample.prepare_noise(latent_image["samples"], seed)
         noise_mask = latent_image.get("noise_mask", None)
-
-        callback = latent_preview.prepare_callback(model, steps)
+        base_callback = latent_preview.prepare_callback(model, steps)
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
+        # Wrap callback to detokenize latent preview states
+        def wrapped_callback(step, x0, x, total_steps):
+            if base_callback is not None and x0 is not None:
+                # x0 is (B, L_fov, C_patched). Reconstruct to (B, C_patched, H, W)
+                try:
+                    x0_full = reconstruct_tokens(
+                        x0, fov_indices, B, C_patched, h_len, w_len, mask_tensor, lr_factor,
+                        device=samples.device, dtype=samples.dtype
+                    )
+                    x0_spatial = rearrange(
+                        x0_full, "b (h w) (c ph pw) -> b c (h ph) (w pw)",
+                        h=h_len, w=w_len, ph=patch_size, pw=patch_size
+                    )[:, :, :H_lat, :W_lat]
+                    # Pass the spatial 4D tensor to the previewer
+                    base_callback(step, x0_spatial, x, total_steps)
+                except Exception:
+                    # Suppress errors if anything goes wrong in the preview path
+                    pass
+            elif base_callback is not None:
+                base_callback(step, x0, x, total_steps)
+
+        # ── 4. Run sampling loop entirely in token space ──────────────
         latents_out = comfy.sample.sample(
             model_clone,
-            noise,
+            noise_fov,
             steps,
             cfg,
             sampler_name,
             scheduler,
             positive,
             negative,
-            latent_image["samples"],
+            samples_fov,
             denoise=denoise,
             noise_mask=noise_mask,
-            callback=callback,
+            callback=wrapped_callback,
             disable_pbar=disable_pbar,
             seed=seed,
         )
 
-        if decode_mode == "merge":
-            return ({"samples": latents_out},)
-
-        # direct mode: reconstruct and blend before returning
-        out = self._direct_decode(
-            latents_out, mask_tensor, lr_factor, model
+        # ── 5. Reconstruct/Upsample ONCE at the end ───────────────────
+        out_full = reconstruct_tokens(
+            latents_out, fov_indices, B, C_patched, h_len, w_len, mask_tensor, lr_factor,
+            device=samples.device, dtype=samples.dtype,
         )
+        out = rearrange(
+            out_full, "b (h w) (c ph pw) -> b c (h ph) (w pw)",
+            h=h_len, w=w_len, ph=patch_size, pw=patch_size,
+        )[:, :, :H_lat, :W_lat]
+
         return ({"samples": out},)
-
-    @staticmethod
-    def _direct_decode(samples, mask, lr_factor, model):
-        """
-        Direct decode: return the DiT-reconstructed latent as-is.
-
-        The DIFFUSION_MODEL wrapper already reconstructs full-resolution tokens
-        via nearest-neighbor expansion of LR tokens at each denoising step.
-        No additional post-processing is needed — any further smoothing would
-        double-degrade the periphery and introduce boundary artifacts.
-        """
-        return samples
 
 
 # ---------------------------------------------------------------------------

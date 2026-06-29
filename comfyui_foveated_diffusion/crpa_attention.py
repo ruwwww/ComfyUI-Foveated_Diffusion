@@ -25,8 +25,22 @@ def build_crpa_state(
     ids_hr = torch.cat([txt_ids, img_ids_fov], dim=1)                # (B, T+L_fov, n_axes)
 
     img_ids_lr = img_ids_fov.clone()
+    
+    import logging
+    logger = logging.getLogger("comfyui_foveated_diffusion")
+    logger.info(
+        "CRPA Debug: img_ids_fov shape=%s, first 3 tokens: %s",
+        tuple(img_ids_fov.shape), img_ids_fov[0, :3].tolist()
+    )
+
     img_ids_lr[:, :, 1] = img_ids_lr[:, :, 1] / float(lr_factor)    # H / d
     img_ids_lr[:, :, 2] = img_ids_lr[:, :, 2] / float(lr_factor)    # W / d
+    
+    logger.info(
+        "CRPA Debug: img_ids_lr divided coordinates: first 3 tokens: %s",
+        img_ids_lr[0, :3].tolist()
+    )
+
     ids_lr = torch.cat([txt_ids, img_ids_lr], dim=1)                # (B, T+L_fov, n_axes)
 
     pe_hr = pe_embedder(ids_hr)   # (B, 1, T+L_fov, pe_dim//2, 2, 2)
@@ -36,10 +50,10 @@ def build_crpa_state(
     txt_mask = torch.ones(T, dtype=torch.bool, device=device)
     
     # res_mask: True for text and HR image tokens
-    res_mask = torch.cat([txt_mask, resolution_mask.bool()])
+    res_mask = torch.cat([txt_mask, resolution_mask.to(device=device, dtype=torch.bool)])
     
     # tl_mask: True for text and top-left/LR image tokens
-    tl_mask = torch.cat([txt_mask, resolution_mask_top_left.bool()])
+    tl_mask = torch.cat([txt_mask, resolution_mask_top_left.to(device=device, dtype=torch.bool)])
 
     hr_idx = torch.where(res_mask)[0]
     lr_idx = torch.where(~res_mask)[0]
@@ -71,20 +85,23 @@ def crpa_attn1_patch(q, k, v, pe, attn_mask, extra_options):
 
     # ── HR path: Q_HR + HR RoPE  →  attend to all K + HR RoPE ───
     if hr_idx.numel() > 0:
-        q_hr = q[:, :, hr_idx, :]
-        q_hr_r = apply_rope1(q_hr, pe_hr[:, :, hr_idx])
+        q_hr = q[:, :, hr_idx, :].contiguous()
+        pe_hr_sliced = pe_hr[:, :, hr_idx].contiguous()
+        q_hr_r = apply_rope1(q_hr, pe_hr_sliced)
         k_hr_r = apply_rope1(k, pe_hr)
         out_hr = optimized_attention(q_hr_r, k_hr_r, v, heads, skip_reshape=True)
         out[:, hr_idx, :] = out_hr
 
     # ── LR path: Q_LR + LR RoPE  →  attend to subsampled K + LR RoPE ───
     if lr_idx.numel() > 0:
-        q_lr = q[:, :, lr_idx, :]
-        q_lr_r = apply_rope1(q_lr, pe_lr[:, :, lr_idx])
+        q_lr = q[:, :, lr_idx, :].contiguous()
+        pe_lr_sliced = pe_lr[:, :, lr_idx].contiguous()
+        q_lr_r = apply_rope1(q_lr, pe_lr_sliced)
 
-        k_sub = k[:, :, tl_idx, :]
-        v_sub = v[:, :, tl_idx, :]
-        k_lr_r = apply_rope1(k_sub, pe_lr[:, :, tl_idx])
+        k_sub = k[:, :, tl_idx, :].contiguous()
+        v_sub = v[:, :, tl_idx, :].contiguous()
+        pe_lr_tl_sliced = pe_lr[:, :, tl_idx].contiguous()
+        k_lr_r = apply_rope1(k_sub, pe_lr_tl_sliced)
 
         out_lr = optimized_attention(q_lr_r, k_lr_r, v_sub, heads, skip_reshape=True)
         out[:, lr_idx, :] = out_lr
