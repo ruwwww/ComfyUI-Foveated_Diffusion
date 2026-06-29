@@ -16,6 +16,8 @@ import comfy.sample
 import comfy.model_management
 import comfy.patcher_extension
 from einops import rearrange
+import latent_preview
+import comfy.utils
 
 from .crpa_attention import build_crpa_state, crpa_attn1_patch, crpa_attn1_output_patch
 from .foveated_tokenizer import (
@@ -374,9 +376,12 @@ class FoveatedKSampler:
         )
         model_clone.model_options["transformer_options"] = te
 
-        # Run sampling (ComfyUI standard path)
+        # Run sampling (ComfyUI standard path) with preview callback
         noise = comfy.sample.prepare_noise(latent_image["samples"], seed)
         noise_mask = latent_image.get("noise_mask", None)
+
+        callback = latent_preview.prepare_callback(model, steps)
+        disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
         latents_out = comfy.sample.sample(
             model_clone,
@@ -390,6 +395,8 @@ class FoveatedKSampler:
             latent_image["samples"],
             denoise=denoise,
             noise_mask=noise_mask,
+            callback=callback,
+            disable_pbar=disable_pbar,
             seed=seed,
         )
 
@@ -459,8 +466,18 @@ class FoveatedVAEDecode:
         lr_factor = foveation_mask.get("lr_factor", 2)
         B, C, H_lat, W_lat = latent.shape
 
-        # Build region masks in latent space
-        mask_float = mask.float().to(latent.device)
+        # Build block-aligned foveation mask in latent space to prevent boundary artifacts
+        h_d, w_d = H_lat // lr_factor, W_lat // lr_factor
+        n_per_block = lr_factor * lr_factor
+        mask_blocks = mask.view(h_d, lr_factor, w_d, lr_factor).permute(0, 2, 1, 3).reshape(h_d, w_d, n_per_block)
+        is_high_res_block = (mask_blocks.sum(dim=-1) > 0)
+        
+        # Expand block selection to original latent resolution shape
+        mask_block_aligned = is_high_res_block.unsqueeze(-1).repeat(1, 1, n_per_block)
+        mask_block_aligned = mask_block_aligned.view(h_d, w_d, lr_factor, lr_factor)
+        mask_block_aligned = mask_block_aligned.permute(0, 2, 1, 3).reshape(H_lat, W_lat)
+        
+        mask_float = mask_block_aligned.float().to(latent.device)
 
         # Decode the fully reconstructed high-res latent directly (no zeroing out)
         hr_image = vae.decode(latent)
