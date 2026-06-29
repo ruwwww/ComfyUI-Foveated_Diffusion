@@ -79,16 +79,37 @@ def load_lora_weights(model_patcher, lora_path: str, strength: float = 1.0):
     Returns:
         model_patcher with LoRA applied
     """
+    import logging
     import comfy.utils
     import comfy.lora
     import comfy.lora_convert
     import comfy.model_patcher
+
+    logger = logging.getLogger("comfyui_foveated_diffusion")
 
     lora_sd = comfy.utils.load_torch_file(lora_path)
     lora_sd = comfy.lora_convert.convert_lora(lora_sd)
 
     key_map = comfy.lora.model_lora_keys_unet(model_patcher.model)
     loaded = comfy.lora.load_lora(lora_sd, key_map)
+
+    loaded_keys = list(loaded.keys())
+    logger.info(
+        f"Loaded {len(loaded_keys)} LoRA key(s) from {lora_path} "
+        f"(strength={strength})"
+    )
+    if len(loaded_keys) == 0:
+        logger.warning(
+            f"No LoRA keys were mapped from {lora_path} — the LoRA may use an "
+            f"unsupported naming convention. "
+            f"Check that the safetensors keys match Flux2 parameter names. "
+            f"First 5 lora keys: {list(lora_sd.keys())[:5]}"
+        )
+    elif len(loaded_keys) < 10:
+        logger.warning(
+            f"Only {len(loaded_keys)} LoRA key(s) loaded — this is fewer than expected "
+            f"for a full Flux2 LoRA. The LoRA may be partially applied."
+        )
 
     model_patcher.add_patches(loaded, strength)
 

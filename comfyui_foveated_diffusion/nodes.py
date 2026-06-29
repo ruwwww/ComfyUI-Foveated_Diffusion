@@ -191,8 +191,16 @@ def _foveated_diffusion_model_wrapper(executor, x, timestep, context, y, guidanc
     3. Call forward_orig with the modified sequence
     4. Detokenize the DiT output back to full-res latent space
     """
+    import logging
+    logger = logging.getLogger("comfyui_foveated_diffusion")
+
     fov_state = transformer_options.get("fov_state", None)
     if fov_state is None:
+        logger.warning(
+            "FoveatedDiffusion wrapper called but fov_state is None — "
+            "wrapper will pass through to normal diffusion. "
+            "This should not happen if the FoveatedKSampler is in the pipeline."
+        )
         return executor(x, timestep, context, y, guidance,
                         ref_latents, control, transformer_options, **kwargs)
 
@@ -216,6 +224,13 @@ def _foveated_diffusion_model_wrapper(executor, x, timestep, context, y, guidanc
 
     # Foveate
     img_fov, fov_indices = build_foveated_tokens(img_spatial, mask, lr_factor)
+    n_tokens_input = img_spatial.shape[1] * img_spatial.shape[2]
+    n_tokens_fov = img_fov.shape[1]
+    reduction = (1.0 - n_tokens_fov / n_tokens_input) * 100
+    logger.info(
+        f"FoveatedDiffusion: {n_tokens_input} -> {n_tokens_fov} tokens "
+        f"({reduction:.1f}% reduction, lr_factor={lr_factor})"
+    )
     img_ids_fov = build_crpa_img_ids(
         img_ids_spatial, mask, lr_factor, x.device, torch.float32
     )
@@ -375,26 +390,14 @@ class FoveatedKSampler:
     @staticmethod
     def _direct_decode(samples, mask, lr_factor, model):
         """
-        Direct decode: bilinear upsample LR regions and blend with HR regions.
+        Direct decode: return the DiT-reconstructed latent as-is.
 
-        The DIFFUSION_MODEL wrapper already reconstructs tokens using nearest-neighbor
-        at each denoising step. This post-process improves periphery quality using
-        bilinear interpolation + mask-weighted blending per the paper's direct mode.
+        The DIFFUSION_MODEL wrapper already reconstructs full-resolution tokens
+        via nearest-neighbor expansion of LR tokens at each denoising step.
+        No additional post-processing is needed — any further smoothing would
+        double-degrade the periphery and introduce boundary artifacts.
         """
-        mask_float = mask.float().to(samples.device)
-        mask_4d = mask_float.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
-
-        B, C, H, W = samples.shape
-
-        # LR: average-pool over d×d blocks, bilinear upsample
-        lr_pooled = F.avg_pool2d(samples, kernel_size=lr_factor, stride=lr_factor)
-        lr_upsampled = F.interpolate(
-            lr_pooled, size=(H, W), mode="bilinear", align_corners=False
-        )
-
-        # Blend: mask=1 → HR (exact), mask=0 → LR (bilinear-upsampled)
-        blended = mask_4d * samples + (1.0 - mask_4d) * lr_upsampled
-        return blended
+        return samples
 
 
 # ---------------------------------------------------------------------------
