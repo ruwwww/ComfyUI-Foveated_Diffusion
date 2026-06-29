@@ -178,7 +178,7 @@ class LoadFoveatedLoRA:
 
 
 # ---------------------------------------------------------------------------
-# DIFFUSION_MODEL wrapper for foveated tokenization + CRPA RoPE
+# DIFFUSION_MODEL wrapper for foveated tokenization
 # ---------------------------------------------------------------------------
 
 def _foveated_diffusion_model_wrapper(executor, x, timestep, context, y, guidance,
@@ -187,10 +187,9 @@ def _foveated_diffusion_model_wrapper(executor, x, timestep, context, y, guidanc
     """Wrapper injected via WrappersMP.DIFFUSION_MODEL.
 
     1. Foveated-tokenize the latent (top-left LR selection)
-    2. Build CRPA state (dual RoPE + resolution masks)
-    3. Inject CRPA attention patches via transformer_options
-    4. Call forward_orig — CRPA patches activate inside attention blocks
-    5. Detokenize DiT output back to full-resolution latent
+    2. Call forward_orig with the foveated token sequence
+       (standard attention + LoRA handles the mixed-resolution tokens)
+    3. Detokenize DiT output back to full-resolution latent
     """
     import logging
     logger = logging.getLogger("comfyui_foveated_diffusion")
@@ -246,21 +245,19 @@ def _foveated_diffusion_model_wrapper(executor, x, timestep, context, y, guidanc
             )
 
     # ── 4. Build CRPA state (dual RoPE, resolution masks) ─────────
-    m = fov_indices["hr_indices"].shape[0]
     crpa_state = build_crpa_state(
         img_ids_fov=img_ids_fov,
         txt_ids=txt_ids,
-        hr_count=m,
-        hr_indices=fov_indices["hr_indices"],
+        resolution_mask=fov_indices["resolution_mask"],
+        resolution_mask_top_left=fov_indices["resolution_mask_top_left"],
         lr_factor=lr_factor,
-        W=w_len,
         pe_embedder=model.pe_embedder,
     )
 
     # ── 5. Inject CRPA attention patches ──────────────────────────
     transformer_options = transformer_options.copy()
     transformer_options["crpa_state"] = crpa_state
-    to = transformer_options  # shorthand for nested key access
+    to = transformer_options
 
     comfy.patcher_extension.merge_nested_dicts(
         to.setdefault("patches", {}),
@@ -275,7 +272,7 @@ def _foveated_diffusion_model_wrapper(executor, x, timestep, context, y, guidanc
         transformer_options=transformer_options,
     )
 
-    # ── 7. Detokenize ─────────────────────────────────────────────
+    # ── 5. Detokenize ─────────────────────────────────────────────
     out_full = reconstruct_tokens(
         out, fov_indices, B, C_patched, h_len, w_len, mask, lr_factor,
         device=x.device, dtype=x.dtype,
@@ -286,6 +283,7 @@ def _foveated_diffusion_model_wrapper(executor, x, timestep, context, y, guidanc
     )[:, :, :H_orig, :W_orig]
 
     return out_full
+
 
 
 # ---------------------------------------------------------------------------
@@ -464,25 +462,26 @@ class FoveatedVAEDecode:
         # Build region masks in latent space
         mask_float = mask.float().to(latent.device)
 
-        # HR latent: zero out LR regions
-        mask_float_4d = mask_float.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
-        hr_latent = latent * mask_float_4d
+        # Decode the fully reconstructed high-res latent directly (no zeroing out)
+        hr_image = vae.decode(latent)
 
-        # LR latent: downsample latent spatially, then upsample for blending
-        # Average-pool over d×d blocks
+        # LR latent: downsample latent spatially to its native low-res resolution
         lr_latent = F.avg_pool2d(latent, kernel_size=lr_factor, stride=lr_factor)
-        lr_latent = F.interpolate(
-            lr_latent, size=(H_lat, W_lat), mode="bilinear", align_corners=False
-        )
-
-        # Decode both
-        hr_image = vae.decode(hr_latent)
+        # Decode at native low-res resolution
         lr_image = vae.decode(lr_latent)
 
-        # Upsample mask to pixel resolution
-        _, _, H_pix, W_pix = hr_image.shape
+        # VAE outputs images in NHWC format: (B, H, W, C)
+        # Permute to NCHW for spatial interpolation and blending: (B, C, H, W)
+        hr_image_nchw = hr_image.permute(0, 3, 1, 2)
+        lr_image_nchw = lr_image.permute(0, 3, 1, 2)
+
+        # Upsample mask and low-res image to pixel resolution
+        _, _, H_pix, W_pix = hr_image_nchw.shape
+        lr_image_nchw = F.interpolate(
+            lr_image_nchw, size=(H_pix, W_pix), mode="bicubic", align_corners=False
+        )
         mask_pixel = F.interpolate(
-            mask_float_4d, size=(H_pix, W_pix), mode="bilinear", align_corners=False
+            mask_float.unsqueeze(0).unsqueeze(0), size=(H_pix, W_pix), mode="bilinear", align_corners=False
         )
         mask_pixel = mask_pixel.clamp(0.0, 1.0)
 
@@ -492,7 +491,9 @@ class FoveatedVAEDecode:
             )
             mask_pixel = mask_pixel.clamp(0.0, 1.0)
 
-        merged = lr_image * (1.0 - mask_pixel) + hr_image * mask_pixel
+        merged_nchw = lr_image_nchw * (1.0 - mask_pixel) + hr_image_nchw * mask_pixel
+        # Permute back to ComfyUI NHWC format
+        merged = merged_nchw.permute(0, 2, 3, 1)
 
         return (merged,)
 
