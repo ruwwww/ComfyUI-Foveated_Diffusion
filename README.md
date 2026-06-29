@@ -18,15 +18,15 @@ Foveated diffusion reduces the sequence token length by running lower resolution
 For **FLUX.2 Klein (20 steps)** generation:
 
 * **Standard FLUX.2 Klein:** **~17.0 seconds**
-* **Foveated FLUX.2 Klein (Circular, radius 0.60):** **~10.0 seconds**
-
-This offers a **~1.7× execution time speedup for the DIT model step** while keeping the gaze/foveal region clear!
+* **Foveated FLUX.2 Klein (Circular, radius 0.60):** **~10.0 seconds** (~1.7× DIT speedup)
+* **Foveated FLUX.2 Klein (Circular, radius 0.30):** **~6.5 seconds** (~2.6× DIT speedup)
 
 ### Image Comparison (Foveated vs. Normal)
 
-| Foveated (~10.0s) | Normal (~17.0s) |
+| Foveated | Normal |
 | :---: | :---: |
-| ![Foveated](images/flux_foveated.png) | ![Normal](images/flux_normal.png) |
+| **Gaze Radius: 0.60 (~10.0s)**<br>![Foveated 0.60](images/flux_foveated.png) | **Standard Klein (~17.0s)**<br>![Normal](images/flux_normal.png) |
+| **Gaze Radius: 0.30 (~6.5s)**<br>![Foveated 0.30](images/flux_foveated_scenery.png) | **Standard Klein (~17.0s)**<br>![Normal Scenery](images/flux_normal_scenery.png) |
 
 ---
 
