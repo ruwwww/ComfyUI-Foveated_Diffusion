@@ -17,14 +17,14 @@ FLUX.2 Klein foveated generation for ComfyUI — implements the paper
 Foveated diffusion reduces the sequence token length by running lower resolution steps in the peripheral blocks. 
 For **FLUX.2 Klein (20 steps)** generation:
 
-* **Standard FLUX.2 Klein:** **~25.0 seconds**
+* **Standard FLUX.2 Klein:** **~17.0 seconds**
 * **Foveated FLUX.2 Klein (Circular, radius 0.60):** **~10.0 seconds**
 
-This offers a **~2.5× execution time speedup for the DIT model step** while keeping the gaze/foveal region clear!
+This offers a **~1.7× execution time speedup for the DIT model step** while keeping the gaze/foveal region clear!
 
 ### Image Comparison (Foveated vs. Normal)
 
-| Foveated (~10.0s) | Normal (~25.0s) |
+| Foveated (~10.0s) | Normal (~17.0s) |
 | :---: | :---: |
 | ![Foveated](images/flux_foveated.png) | ![Normal](images/flux_normal.png) |
 
