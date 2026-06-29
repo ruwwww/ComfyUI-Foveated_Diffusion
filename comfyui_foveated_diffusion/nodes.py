@@ -386,12 +386,17 @@ class FoveatedKSampler:
         disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
         # Wrap callback to detokenize latent preview states
+        import logging
+        preview_logger = logging.getLogger("comfyui_foveated_diffusion")
+
         def wrapped_callback(step, x0, x, total_steps):
             if base_callback is not None and x0 is not None:
                 # x0 is (B, L_fov, C_patched). Reconstruct to (B, C_patched, H, W)
                 try:
+                    # Move x0 to the samples device if it differs
+                    x0_device = x0.to(device=samples.device)
                     x0_full = reconstruct_tokens(
-                        x0, fov_indices, B, C_patched, h_len, w_len, mask_tensor, lr_factor,
+                        x0_device, fov_indices, B, C_patched, h_len, w_len, mask_tensor, lr_factor,
                         device=samples.device, dtype=samples.dtype
                     )
                     x0_spatial = rearrange(
@@ -400,9 +405,9 @@ class FoveatedKSampler:
                     )[:, :, :H_lat, :W_lat]
                     # Pass the spatial 4D tensor to the previewer
                     base_callback(step, x0_spatial, x, total_steps)
-                except Exception:
-                    # Suppress errors if anything goes wrong in the preview path
-                    pass
+                except Exception as e:
+                    import traceback
+                    preview_logger.warning("FoveatedDiffusion: preview error: %s\n%s", str(e), traceback.format_exc())
             elif base_callback is not None:
                 base_callback(step, x0, x, total_steps)
 
