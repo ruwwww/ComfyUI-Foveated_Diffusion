@@ -60,13 +60,11 @@ def build_foveated_tokens(
     hr_indices = torch.where(mask_flat)[0]  # (m,)
     hr_tokens = img_flat[:, hr_indices, :]  # (B, m, C)
 
-    # LR blocks: each d×d block contributes 1 token (block mean)
+    # LR blocks: each d×d block contributes 1 token (top-left)
     img_blocks = img.view(B, h_d, lr_factor, w_d, lr_factor, C)
-    img_blocks = img_blocks.permute(0, 1, 3, 2, 4, 5)  # (B, h_d, w_d, d, d, C)
-    img_blocks = img_blocks.reshape(B, h_d * w_d, lr_factor * lr_factor, C)
 
-    # LR token: block mean — consistent with build_crpa_img_ids (position mean)
-    lr_tokens = img_blocks.mean(dim=2)  # (B, h_d*w_d, C)
+    # LR token: top-left of each block (matches reference / LoRA training)
+    lr_tokens = img_blocks[:, :, 0, :, 0, :].reshape(B, h_d * w_d, C)  # (B, h_d*w_d, C)
 
     # Concatenate HR tokens + LR tokens
     img_fov = torch.cat([hr_tokens, lr_tokens], dim=1)  # (B, m + h_d*w_d, C)
@@ -128,15 +126,11 @@ def build_crpa_img_ids(
     hr_indices = torch.where(mask_flat)[0]
     hr_ids = img_ids.reshape(H * W, n_axes)[hr_indices]  # (m, n_axes)
 
-    # Compute LR token img_ids: mean of block positions → block center
+    # Compute LR token img_ids: top-left position of each d×d block.
+    # The HR→LR coordinate scaling (H // lr_factor, W // lr_factor) is done
+    # later by build_crpa_state when constructing the LR RoPE table.
     img_ids_blocks = img_ids.view(h_d, lr_factor, w_d, lr_factor, n_axes)
-    img_ids_blocks = img_ids_blocks.permute(0, 2, 1, 3, 4)  # (h_d, w_d, d, d, n_axes)
-
-    # Mean over the d×d spatial positions within each block.
-    # For even d this gives the exact geometric center (e.g. (0.5, 0.5) for d=2),
-    # which matches the block-mean token content in build_foveated_tokens.
-    lr_ids = img_ids_blocks.mean(dim=(2, 3))  # (h_d, w_d, n_axes)
-    lr_ids = lr_ids.reshape(h_d * w_d, n_axes)
+    lr_ids = img_ids_blocks[:, 0, :, 0, :].reshape(h_d * w_d, n_axes)
 
     img_ids_fov = torch.cat([hr_ids, lr_ids], dim=0).to(device=device, dtype=dtype)
     return img_ids_fov

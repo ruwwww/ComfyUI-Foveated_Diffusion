@@ -17,6 +17,7 @@ import comfy.model_management
 import comfy.patcher_extension
 from einops import rearrange
 
+from .crpa_attention import build_crpa_state, crpa_attn1_patch, crpa_attn1_output_patch
 from .foveated_tokenizer import (
     build_foveated_tokens,
     build_crpa_img_ids,
@@ -185,11 +186,11 @@ def _foveated_diffusion_model_wrapper(executor, x, timestep, context, y, guidanc
                                        **kwargs):
     """Wrapper injected via WrappersMP.DIFFUSION_MODEL.
 
-    Intercepts the Flux2 DiT forward pass to:
-    1. Foveated-tokenize the latent (replace full-res tokens with mixed-resolution)
-    2. Build CRPA-corrected img_ids (positional encoding for mixed-resolution tokens)
-    3. Call forward_orig with the modified sequence
-    4. Detokenize the DiT output back to full-res latent space
+    1. Foveated-tokenize the latent (top-left LR selection)
+    2. Build CRPA state (dual RoPE + resolution masks)
+    3. Inject CRPA attention patches via transformer_options
+    4. Call forward_orig — CRPA patches activate inside attention blocks
+    5. Detokenize DiT output back to full-resolution latent
     """
     import logging
     logger = logging.getLogger("comfyui_foveated_diffusion")
@@ -197,9 +198,8 @@ def _foveated_diffusion_model_wrapper(executor, x, timestep, context, y, guidanc
     fov_state = transformer_options.get("fov_state", None)
     if fov_state is None:
         logger.warning(
-            "FoveatedDiffusion wrapper called but fov_state is None — "
-            "wrapper will pass through to normal diffusion. "
-            "This should not happen if the FoveatedKSampler is in the pipeline."
+            "FoveatedDiffusion: called without fov_state — passing through. "
+            "Wire a FoveatedKSampler into the pipeline."
         )
         return executor(x, timestep, context, y, guidance,
                         ref_latents, control, transformer_options, **kwargs)
@@ -212,7 +212,7 @@ def _foveated_diffusion_model_wrapper(executor, x, timestep, context, y, guidanc
     patch_size = model.patch_size
     n_axes = len(model.params.axes_dim)
 
-    # Process image to get token representation (full-res)
+    # ── 1. Full-res tokenisation via process_img ───────────────────
     img, img_ids = model.process_img(x, transformer_options=transformer_options)
     C_patched = img.shape[2]
 
@@ -222,26 +222,22 @@ def _foveated_diffusion_model_wrapper(executor, x, timestep, context, y, guidanc
     img_spatial = img.view(B, h_len, w_len, C_patched)
     img_ids_spatial = img_ids[0].view(h_len, w_len, n_axes)
 
-    # Foveate
+    # ── 2. Foveate tokens (top-left selection for LR blocks) ─────
     img_fov, fov_indices = build_foveated_tokens(img_spatial, mask, lr_factor)
-    n_tokens_input = img_spatial.shape[1] * img_spatial.shape[2]
-    n_tokens_fov = img_fov.shape[1]
-    reduction = (1.0 - n_tokens_fov / n_tokens_input) * 100
-    logger.info(
-        f"FoveatedDiffusion: {n_tokens_input} -> {n_tokens_fov} tokens "
-        f"({reduction:.1f}% reduction, lr_factor={lr_factor})"
-    )
-    img_ids_fov = build_crpa_img_ids(
-        img_ids_spatial, mask, lr_factor, x.device, torch.float32
-    )
+    img_ids_fov = build_crpa_img_ids(img_ids_spatial, mask, lr_factor, x.device, torch.float32)
     img_ids_fov = img_ids_fov.unsqueeze(0).expand(B, -1, -1)
 
-    # Build text position IDs
-    txt_ids = torch.zeros(
-        (B, context.shape[1], n_axes),
-        device=x.device,
-        dtype=torch.float32,
+    n_tokens_input = h_len * w_len
+    n_tokens_fov = img_fov.shape[1]
+    logger.info(
+        "FoveatedDiffusion: %d -> %d tokens (%.1f%% reduction, lr_factor=%d)",
+        n_tokens_input, n_tokens_fov,
+        (1.0 - n_tokens_fov / n_tokens_input) * 100,
+        lr_factor,
     )
+
+    # ── 3. Build txt_ids (same as _forward) ────────────────────────
+    txt_ids = torch.zeros((B, context.shape[1], n_axes), device=x.device, dtype=torch.float32)
     if len(model.params.txt_ids_dims) > 0:
         for i in model.params.txt_ids_dims:
             txt_ids[:, :, i] = torch.linspace(
@@ -249,20 +245,41 @@ def _foveated_diffusion_model_wrapper(executor, x, timestep, context, y, guidanc
                 device=x.device, dtype=torch.float32,
             )
 
-    # Run forward_orig with foveated sequence
+    # ── 4. Build CRPA state (dual RoPE, resolution masks) ─────────
+    m = fov_indices["hr_indices"].shape[0]
+    crpa_state = build_crpa_state(
+        img_ids_fov=img_ids_fov,
+        txt_ids=txt_ids,
+        hr_count=m,
+        hr_indices=fov_indices["hr_indices"],
+        lr_factor=lr_factor,
+        W=w_len,
+        pe_embedder=model.pe_embedder,
+    )
+
+    # ── 5. Inject CRPA attention patches ──────────────────────────
+    transformer_options = transformer_options.copy()
+    transformer_options["crpa_state"] = crpa_state
+    to = transformer_options  # shorthand for nested key access
+
+    comfy.patcher_extension.merge_nested_dicts(
+        to.setdefault("patches", {}),
+        {"attn1_patch": [crpa_attn1_patch], "attn1_output_patch": [crpa_attn1_output_patch]},
+        copy_dict1=False,
+    )
+
+    # ── 6. Run forward_orig with foveated sequence ────────────────
     out = model.forward_orig(
         img_fov, img_ids_fov, context, txt_ids,
         timestep, y, guidance, control,
         transformer_options=transformer_options,
     )
 
-    # Detokenize
+    # ── 7. Detokenize ─────────────────────────────────────────────
     out_full = reconstruct_tokens(
         out, fov_indices, B, C_patched, h_len, w_len, mask, lr_factor,
         device=x.device, dtype=x.dtype,
     )
-
-    # Rearrange to 4D latent
     out_full = rearrange(
         out_full, "b (h w) (c ph pw) -> b c (h ph) (w pw)",
         h=h_len, w=w_len, ph=patch_size, pw=patch_size,
