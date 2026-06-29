@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
 *.pyo
+comfyui_foveated_diffusion/
+foveated_diffusion/

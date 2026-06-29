@@ -1,4 +1,6 @@
-from .comfyui_foveated_diffusion.nodes import (
+"""FoveatedDiffusion — FLUX.2 Klein foveated generation."""
+
+from .nodes import (
     FoveationMaskNode,
     LoadFoveatedLoRA,
     FoveatedKSampler,

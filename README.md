@@ -3,8 +3,34 @@
 FLUX.2 Klein foveated generation for ComfyUI — implements the paper
 *"Foveated Diffusion: Prioritized Distortion for Efficiency"* (Brian Chao et al., Stanford 2026).
 
-**Speed:** 2–4× faster generation by processing peripheral image regions at lower resolution
-while maintaining full quality in the foveal region.
+**Speed:** 2–4× faster generation by processing peripheral image regions at lower resolution while maintaining full quality in the foveal region.
+
+## Paper & Resources
+- **Paper Website:** [Foveated Diffusion Project Page](https://bchao1.github.io/foveated-diffusion/)
+- **Original Source Code:** [GitHub - bchao1/foveated_diffusion](https://github.com/bchao1/foveated_diffusion)
+- **Paper Link:** [arXiv:2603.23491 (2026)](https://arxiv.org/abs/2603.23491)
+- **HuggingFace Models:** [bchao1/foveated-diffusion on Hugging Face](https://huggingface.co/bchao1/foveated-diffusion)
+
+---
+
+## ⚡ Performance Comparison
+Foveated diffusion reduces the sequence token length by running lower resolution steps in the peripheral blocks. 
+For **FLUX.2 Klein (20 steps)** generation:
+
+* **Standard FLUX.2 Klein:** **~25.0 seconds** ([flux_normal.png](images/flux_normal.png))
+* **Foveated FLUX.2 Klein (Circular, radius 0.60):** **~10.0 seconds** ([flux_foveated.png](images/flux_foveated.png))
+
+This offers a **~2.5× execution time speedup for the DIT model step** while keeping the gaze/foveal region clear!
+
+---
+
+## 🎨 Workflows & Visualization
+The foveation mask overlays and visualizes the gaze region directly in ComfyUI:
+
+### Foveated Diffusion Workflow
+![Foveated Diffusion Workflow](images/workflow.png)
+
+---
 
 ## Nodes
 
@@ -28,11 +54,11 @@ while maintaining full quality in the foveal region.
 
 [EmptyLatentImage 1024×1024] → LATENT
          |
-[FoveationMask (FovDiff)] ← latent, center_x=0, center_y=0, radius=0.3
+[FoveationMask (FovDiff)] ← latent, center_x=0, center_y=0, radius=0.6
          | FOVEATION_MASK
          |
 [FoveatedKSampler (FovDiff)] ← MODEL, positive, negative, LATENT, FOVEATION_MASK
-         |                        steps=50, cfg=4.0
+         |                        steps=20, cfg=4.0
          | LATENT
          |
 [VAEDecode] → IMAGE
@@ -44,7 +70,7 @@ while maintaining full quality in the foveal region.
 
 | lr_factor | Peripheral resolution | Token reduction | Expected speedup |
 |-----------|----------------------|-----------------|-----------------|
-| 2 | 1/4 tokens per block | ~40-50% | ~1.5-2× |
+| 2 | 1/4 tokens per block | ~40-50% | ~1.5-2.5× |
 | 4 | 1/16 tokens per block | ~60-70% | ~3-4× |
 
 Speedup depends on mask coverage — larger foveal region = less speedup.
@@ -52,7 +78,7 @@ Speedup depends on mask coverage — larger foveal region = less speedup.
 ## Mask Parameters
 
 - `center_x`, `center_y`: Normalized gaze position (-1 = left/top, +1 = right/bottom, 0 = center)
-- `radius`: Foveal radius as fraction of image half-width (0.30 = default paper setting)
+- `radius`: Foveal radius as fraction of image half-width (0.30 = default paper setting, 0.60 = comparison example)
 - `mask_shape`: circular, square, or ellipse
 
 ## LoRA Modes
@@ -74,10 +100,3 @@ Speedup depends on mask coverage — larger foveal region = less speedup.
 - `einops`
 - `huggingface_hub` (for auto-download)
 - Pre-trained LoRA from `bchao1/foveated-diffusion` on HuggingFace
-
-## Paper
-
-Foveated Diffusion: Prioritized Distortion for Efficiency  
-Brian Chao, Lior Yariv, Howard Xiao, Gordon Wetzstein  
-arXiv 2603.23491, 2026  
-https://arxiv.org/abs/2603.23491
