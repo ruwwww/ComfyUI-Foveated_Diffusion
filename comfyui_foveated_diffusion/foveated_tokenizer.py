@@ -54,15 +54,13 @@ def build_foveated_tokens(
     is_low_res_block = ~is_high_res_block
 
     # Prepare downsampled low-res tokens for low-res blocks
-    # Matching official average mode: bilinear downsampling scaled by lr_factor
-    img_spatial = img.permute(0, 3, 1, 2) # (B, C, H, W)
-    img_down = torch_F.interpolate(img_spatial, scale_factor=1.0 / lr_factor, mode="bilinear") * float(lr_factor)
-    img_down = img_down.permute(0, 2, 3, 1) # (B, h_d, w_d, C)
+    # Slice the top-left token (index 0) of each block directly
+    img_down = img_blocks[:, :, :, 0, :]
 
     import logging
     logger = logging.getLogger("comfyui_foveated_diffusion")
     logger.info(
-        "FoveatedTokenizer Debug: (Official Match) img shape=%s, img_down shape=%s, lr_factor=%d",
+        "FoveatedTokenizer Debug: (Top-Left Subsampling) img shape=%s, img_down shape=%s, lr_factor=%d",
         tuple(img.shape), tuple(img_down.shape), lr_factor
     )
 
